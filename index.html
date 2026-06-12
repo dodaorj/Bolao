@@ -114,7 +114,22 @@ async function savePredictions(){if(!currentUser||(!currentProfile?.approved&&!c
 async function loadUserPredictions(){if(!currentUser)return;const {data}=await sb.from("predictions").select("*").eq("user_id",currentUser.id).maybeSingle();if(!data)return;document.querySelectorAll(".score-input").forEach(i=>{const v=data.matches?.[i.dataset.key]?.[i.dataset.side];i.value=v??""});document.getElementById("championPick").value=data.podium?.champion||"Brazil";document.getElementById("runnerUpPick").value=data.podium?.runnerUp||"France";document.getElementById("thirdPick").value=data.podium?.third||"Argentina";if(!currentProfile?.is_admin)lockBolao()}
 function populatePodium(){const options=Object.entries(TEAMS).map(([k,l])=>`<option value="${k}">${l}</option>`).join('');['championPick','runnerUpPick','thirdPick'].forEach(id=>$(id).innerHTML=options);$('championPick').value='Brazil';$('runnerUpPick').value='France';$('thirdPick').value='Argentina'}
 function exportPredictions(){const rows=[['Time 1','Placar','X','Time 2','Placar']],form=collectFormPredictions();allFixtures().forEach(f=>{const p=form[matchKey(f)]||{};rows.push([cleanName(TEAMS[f.home]),p.home??'','X',cleanName(TEAMS[f.away]),p.away??''])});const csv=rows.map(r=>r.map(v=>`"${String(v).replace(/"/g,'""')}"`).join(';')).join('\n');const blob=new Blob(['\ufeff'+csv],{type:'text/csv;charset=utf-8;'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download='meu-bolao-pro-ultra.csv';document.body.appendChild(a);a.click();document.body.removeChild(a);URL.revokeObjectURL(url)}
-async function getOfficialResults(){const {data,error}=await sb.from('official_results').select('*');if(error){const msg='Não foi possível carregar os placares oficiais para este usuário. Verifique as políticas RLS da tabela official_results no Supabase para permitir SELECT para usuários aprovados.';if($('rankingBox'))$('rankingBox').innerHTML=`<p class="text-sm text-yellow-300">${msg}<br><span class="text-xs text-slate-400">Erro técnico: ${error.message}</span></p>`;return{};}const r={};(data||[]).forEach(row=>r[row.match_key]=row.result||{});return r}
+async function getOfficialResults(){
+  const {data,error}=await sb.from('official_results').select('*');
+  if(error){
+    console.error('Erro ao ler official_results:', error);
+    return {};
+  }
+  const r={};
+  (data||[]).forEach(row=>{
+    const result = row.result || {};
+    r[row.match_key]={
+      home: result.home ?? row.home ?? row.home_score ?? row.score_home ?? '',
+      away: result.away ?? row.away ?? row.away_score ?? row.score_away ?? ''
+    };
+  });
+  return r;
+}
 async function renderOfficialResults(){if(!currentProfile?.is_admin)return;const official=await getOfficialResults();$('officialResultsBox').innerHTML=Object.entries(GROUPS).map(([g,t])=>`<details open class="bg-slate-950/30 border border-slate-800 rounded-2xl overflow-hidden"><summary class="cursor-pointer p-4 font-extrabold text-yellow-300">Grupo ${g}</summary><div class="p-4 pt-0 overflow-x-auto"><table class="w-full text-sm"><tbody>${fixturesForGroup(g,t).map(f=>{const k=matchKey(f),r=official[k]||{};return `<tr class="border-t border-slate-800"><td class="py-3 min-w-[220px] font-semibold">${TEAMS[f.home]} <span class="text-slate-500">x</span> ${TEAMS[f.away]}</td><td class="py-3 text-center whitespace-nowrap"><input data-official-key="${k}" data-side="home" type="number" min="0" max="20" value="${r.home??''}" class="official-input w-16 bg-slate-900 border border-slate-700 rounded-xl px-2 py-2 text-center font-bold" /><span class="mx-2 text-slate-500 font-bold">x</span><input data-official-key="${k}" data-side="away" type="number" min="0" max="20" value="${r.away??''}" class="official-input w-16 bg-slate-900 border border-slate-700 rounded-xl px-2 py-2 text-center font-bold" /></td></tr>`}).join('')}</tbody></table></div></details>`).join('')}
 async function saveOfficialResults(){if(!currentProfile?.is_admin)return alert('Apenas admin pode salvar placares oficiais.');const rows=[];document.querySelectorAll('.official-input').forEach(i=>{const k=i.dataset.officialKey,s=i.dataset.side;let row=rows.find(r=>r.match_key===k);if(!row){row={match_key:k,result:{},updated_at:new Date().toISOString()};rows.push(row)}row.result[s]=i.value===''?'':Number(i.value)});const {error}=await sb.from('official_results').upsert(rows,{onConflict:'match_key'});if(error)return alert(error.message);alert('Placares oficiais salvos. Ranking recalculado.');await renderRanking();await renderChart()}
 function scorePrediction(pred,actual){if(!actual||actual.home===''||actual.away===''||pred.home===''||pred.away==='')return 0;const ph=Number(pred.home),pa=Number(pred.away),ah=Number(actual.home),aa=Number(actual.away);if(ph===ah&&pa===aa)return 5;const po=ph>pa?'H':ph<pa?'A':'D',ao=ah>aa?'H':ah<aa?'A':'D';let pts=po===ao?3:0;if(ph===ah)pts++;if(pa===aa)pts++;return pts}
@@ -201,13 +216,26 @@ async function renderChart(){
 
   if (chart) chart.destroy();
 
+  const fixtures = allFixtures();
+
+  function isOfficialFilled(result){
+    if(!result) return false;
+    const h = result.home;
+    const a = result.away;
+    return h !== '' && a !== '' &&
+      h !== undefined && a !== undefined &&
+      h !== null && a !== null &&
+      !Number.isNaN(Number(h)) && !Number.isNaN(Number(a));
+  }
+
   if (error) {
+    console.error('Erro ao ler predictions para o gráfico:', error);
     chart = new Chart(ctx, {
       type: 'line',
       data: {
         labels: ['Erro'],
         datasets: [{
-          label: 'Erro ao carregar ranking',
+          label: 'Erro ao carregar usuários',
           data: [0],
           tension: .35
         }]
@@ -216,15 +244,11 @@ async function renderChart(){
         responsive: true,
         plugins: {
           legend: { labels: { color: '#cbd5e1' } },
-          tooltip: {
-            callbacks: {
-              label: () => 'Erro ao ler predictions. Verifique RLS no Supabase.'
-            }
-          }
+          tooltip: { callbacks: { label: () => 'Erro ao ler predictions. Verifique RLS no Supabase.' } }
         },
         scales: {
           x: { ticks: { color: '#94a3b8' }, grid: { color: 'rgba(148,163,184,.12)' } },
-          y: { beginAtZero: true, ticks: { color: '#94a3b8', precision: 0, callback: value => Number(value).toFixed(0) }, grid: { color: 'rgba(148,163,184,.12)' } }
+          y: { beginAtZero: true, ticks: { color: '#94a3b8', precision: 0, stepSize: 1, callback: value => Number(value).toFixed(0) }, grid: { color: 'rgba(148,163,184,.12)' } }
         }
       }
     });
@@ -232,50 +256,55 @@ async function renderChart(){
   }
 
   const predictions = data || [];
-  const fixtures = allFixtures();
 
-  function isOfficialFilled(result){
-    return result &&
-      result.home !== '' &&
-      result.away !== '' &&
-      result.home !== undefined &&
-      result.away !== undefined &&
-      result.home !== null &&
-      result.away !== null;
-  }
-
-  // Mostra até a última rodada que tenha pelo menos um placar oficial preenchido.
-  // Soma apenas os jogos que já têm placar oficial.
+  // Rodadas com pelo menos um placar oficial preenchido.
   const updatedRounds = [1,2,3].filter(round =>
     fixtures.some(f => f.round === round && isOfficialFilled(official[matchKey(f)]))
   );
 
+  // Debug útil no navegador: F12 > Console
+  console.log('Placares oficiais lidos:', official);
+  console.log('Rodadas detectadas no gráfico:', updatedRounds);
+
   const labels = ['Início', ...updatedRounds.map(r => `Rodada ${r}`)];
 
-  const datasets = predictions.map(user => {
-    let cumulative = 0;
-    const points = [0];
+  let datasets;
 
-    updatedRounds.forEach(round => {
-      fixtures
-        .filter(f => f.round === round)
-        .forEach(f => {
-          const k = matchKey(f);
-          if (isOfficialFilled(official[k])) {
-            cumulative += scorePrediction(user.matches?.[k] || {}, official[k]);
-          }
-        });
-      points.push(cumulative);
-    });
-
-    return {
+  if (!updatedRounds.length) {
+    // Mantém todos no zero, mas deixa claro no tooltip que nenhum placar foi detectado.
+    datasets = predictions.map(user => ({
       label: user.user_name || user.email,
-      data: points,
+      data: [0],
       tension: .35,
       pointRadius: 5,
       pointHoverRadius: 7
-    };
-  });
+    }));
+  } else {
+    datasets = predictions.map(user => {
+      let cumulative = 0;
+      const points = [0];
+
+      updatedRounds.forEach(round => {
+        fixtures
+          .filter(f => f.round === round)
+          .forEach(f => {
+            const k = matchKey(f);
+            if (isOfficialFilled(official[k])) {
+              cumulative += scorePrediction(user.matches?.[k] || {}, official[k]);
+            }
+          });
+        points.push(cumulative);
+      });
+
+      return {
+        label: user.user_name || user.email,
+        data: points,
+        tension: .35,
+        pointRadius: 5,
+        pointHoverRadius: 7
+      };
+    });
+  }
 
   const groupedNamesByPoint = {};
   labels.forEach((label, index) => {
@@ -293,25 +322,24 @@ async function renderChart(){
     data: { labels, datasets },
     options: {
       responsive: true,
-      interaction: {
-        mode: 'nearest',
-        intersect: true
-      },
+      interaction: { mode: 'nearest', intersect: true },
       plugins: {
         legend: { labels: { color: '#cbd5e1' } },
         tooltip: {
           callbacks: {
             title: items => {
               const item = items[0];
+              if (!updatedRounds.length) return 'Nenhum placar oficial detectado';
               return `${item.label} — ${Math.round(item.parsed.y)} pts`;
             },
             label: item => {
+              if (!updatedRounds.length) return 'Confira se os placares foram salvos em official_results.';
               const index = item.dataIndex;
               const score = item.parsed.y;
-              const names = groupedNamesByPoint[index]?.[score] || [item.dataset.label];
-              return names;
+              return groupedNamesByPoint[index]?.[score] || [item.dataset.label];
             },
             afterBody: items => {
+              if (!updatedRounds.length) return ['Abra F12 > Console para ver o que foi lido do Supabase.'];
               const item = items[0];
               const names = groupedNamesByPoint[item.dataIndex]?.[item.parsed.y] || [];
               return names.length > 1 ? [`Total empatados: ${names.length}`] : [];
@@ -326,6 +354,7 @@ async function renderChart(){
         },
         y: {
           beginAtZero: true,
+          suggestedMax: 10,
           ticks: {
             color: '#94a3b8',
             precision: 0,
