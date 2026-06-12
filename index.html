@@ -128,28 +128,130 @@ async function getAllPredictionsForRanking(){
   return data||[];
 }
 function isOfficialFilled(actual){return actual&&actual.home!==''&&actual.away!==''&&actual.home!==undefined&&actual.away!==undefined}
-async function computeRanking(){const official=await getOfficialResults();const data=await getAllPredictionsForRanking();return(data||[]).map(e=>{let points=0;allFixtures().forEach(f=>{const k=matchKey(f);points+=scorePrediction(e.matches?.[k]||{},official[k])});return{name:e.user_name||e.email,email:e.email,points}}).sort((a,b)=>b.points-a.points)}
-async function computeEvolution(){
+async function computeRanking(){
   const official=await getOfficialResults();
-  const predictions=await getAllPredictionsForRanking();
-  const rounds=[1,2,3];
-  const labels=['Início',...rounds.map(r=>`Rodada ${r}`)];
-  const datasets=predictions.map(e=>{
-    let cumulative=0;
-    const data=[0];
-    rounds.forEach(round=>{
-      allFixtures().filter(f=>f.round===round).forEach(f=>{
-        const k=matchKey(f),actual=official[k];
-        if(isOfficialFilled(actual))cumulative+=scorePrediction(e.matches?.[k]||{},actual);
-      });
-      data.push(cumulative);
+  const {data,error}=await sb.from('predictions').select('*');
+  if(error){
+    $('rankingBox').innerHTML=`<p class="text-sm text-red-300">Erro ao carregar ranking: ${error.message}. Verifique as políticas RLS das tabelas predictions e official_results.</p>`;
+    return [];
+  }
+  return(data||[]).map(e=>{
+    let points=0;
+    allFixtures().forEach(f=>{
+      const k=matchKey(f);
+      points+=scorePrediction(e.matches?.[k]||{},official[k]);
     });
-    return{label:e.user_name||e.email,data,tension:.35,fill:false,pointRadius:4,pointHoverRadius:6};
-  });
-  return{labels,datasets};
+    return{name:e.user_name||e.email,email:e.email,points,prediction:e};
+  }).sort((a,b)=>b.points-a.points || a.name.localeCompare(b.name));
 }
-async function renderRanking(){const ranking=await computeRanking();if(!ranking.length){$('rankingBox').innerHTML=$('rankingBox').innerHTML||'<p class="text-sm text-slate-400">Ainda não há palpites salvos para montar o ranking.</p>';return}$('rankingBox').innerHTML=`<table class="w-full text-sm"><thead class="text-xs uppercase text-slate-500 border-b border-slate-800"><tr><th class="text-left py-2">#</th><th class="text-left py-2">Participante</th><th class="text-center py-2">Pontos</th></tr></thead><tbody>${ranking.map((u,i)=>`<tr class="border-b border-slate-800/70"><td class="py-3 font-bold text-cyan-300">${i+1}</td><td class="py-3 font-semibold">${u.name}</td><td class="py-3 text-center font-extrabold text-yellow-300">${u.points}</td></tr>`).join('')}</tbody></table>`}
-async function renderChart(){const evolution=await computeEvolution();const ctx=$('pointsChart');if(chart)chart.destroy();chart=new Chart(ctx,{type:'line',data:evolution,options:{responsive:true,interaction:{mode:'index',intersect:false},plugins:{legend:{labels:{color:'#cbd5e1'}},tooltip:{callbacks:{label:context=>`${context.dataset.label}: ${context.parsed.y} pts`}}},scales:{x:{ticks:{color:'#94a3b8'},grid:{color:'rgba(148,163,184,.12)'}},y:{beginAtZero:true,ticks:{color:'#94a3b8',precision:0},grid:{color:'rgba(148,163,184,.12)'}}}}})}
+async function renderRanking(){
+  const ranking=await computeRanking();
+  if(!ranking.length){
+    $('rankingBox').innerHTML='<p class="text-sm text-slate-400">Ranking ainda sem participantes ou sem permissão para leitura.</p>';
+    return;
+  }
+  $('rankingBox').innerHTML=`<table class="w-full text-sm"><thead class="text-xs uppercase text-slate-500 border-b border-slate-800"><tr><th class="text-left py-2">#</th><th class="text-left py-2">Participante</th><th class="text-center py-2">Pontos</th></tr></thead><tbody>${ranking.map((u,i)=>`<tr class="border-b border-slate-800/70"><td class="py-3 font-bold text-cyan-300">${i+1}</td><td class="py-3 font-semibold">${u.name}</td><td class="py-3 text-center font-extrabold text-yellow-300">${u.points}</td></tr>`).join('')}</tbody></table>`;
+}
+function roundIsComplete(round,official){
+  const fixtures=allFixtures().filter(f=>f.round===round);
+  return fixtures.length>0 && fixtures.every(f=>{
+    const r=official[matchKey(f)];
+    return r && r.home!=='' && r.away!=='' && r.home!==undefined && r.away!==undefined;
+  });
+}
+function completedRounds(official){
+  return [1,2,3].filter(r=>roundIsComplete(r,official));
+}
+function pointsUntilRound(prediction,official,round){
+  let points=0;
+  allFixtures().filter(f=>f.round<=round).forEach(f=>{
+    const k=matchKey(f);
+    points+=scorePrediction(prediction.matches?.[k]||{},official[k]);
+  });
+  return points;
+}
+async function computeChartSeries(){
+  const official=await getOfficialResults();
+  const {data,error}=await sb.from('predictions').select('*');
+  if(error)throw error;
+  const rounds=completedRounds(official);
+  const labels=['Início',...rounds.map(r=>`Rodada ${r}`)];
+  const users=(data||[]).map(e=>({
+    name:e.user_name||e.email,
+    email:e.email,
+    prediction:e,
+    pointsByStep:[0,...rounds.map(r=>pointsUntilRound(e,official,r))]
+  })).sort((a,b)=>{
+    const ap=a.pointsByStep[a.pointsByStep.length-1]||0;
+    const bp=b.pointsByStep[b.pointsByStep.length-1]||0;
+    return bp-ap || a.name.localeCompare(b.name);
+  });
+  return {labels,users,rounds};
+}
+function sameLineUsers(users,targetUser){
+  return users.filter(u=>u.pointsByStep.length===targetUser.pointsByStep.length && u.pointsByStep.every((v,i)=>v===targetUser.pointsByStep[i]));
+}
+async function renderChart(){
+  const ctx=$('pointsChart');
+  if(chart)chart.destroy();
+  try{
+    const {labels,users,rounds}=await computeChartSeries();
+    if(!users.length){
+      chart=new Chart(ctx,{type:'line',data:{labels:['Início'],datasets:[]},options:{responsive:true,plugins:{legend:{labels:{color:'#cbd5e1'}}},scales:{x:{ticks:{color:'#94a3b8'},grid:{color:'rgba(148,163,184,.12)'}},y:{beginAtZero:true,ticks:{color:'#94a3b8'},grid:{color:'rgba(148,163,184,.12)'}}}}});
+      return;
+    }
+    const datasets=users.map((u,idx)=>({
+      label:u.name,
+      data:u.pointsByStep,
+      tension:.35,
+      pointRadius:5,
+      pointHoverRadius:8,
+      borderWidth:2,
+      userIndex:idx
+    }));
+    chart=new Chart(ctx,{
+      type:'line',
+      data:{labels,datasets},
+      options:{
+        responsive:true,
+        interaction:{mode:'nearest',intersect:true},
+        plugins:{
+          legend:{labels:{color:'#cbd5e1'}},
+          tooltip:{
+            callbacks:{
+              title:function(items){
+                const item=items[0];
+                return item?.label || '';
+              },
+              label:function(context){
+                const user=users[context.dataset.userIndex];
+                const pointIndex=context.dataIndex;
+                const points=context.parsed.y;
+                const tied=sameLineUsers(users,user).filter(u=>u.pointsByStep[pointIndex]===points);
+                const names=tied.map(u=>u.name);
+                const header=`${points} ponto${points===1?'':'s'}: ${names.length} participante${names.length===1?'':'s'}`;
+                return [header,...names];
+              }
+            }
+          }
+        },
+        scales:{
+          x:{ticks:{color:'#94a3b8'},grid:{color:'rgba(148,163,184,.12)'}},
+          y:{beginAtZero:true,ticks:{color:'#94a3b8'},grid:{color:'rgba(148,163,184,.12)'}}
+        }
+      }
+    });
+  }catch(e){
+    chart=new Chart(ctx,{type:'line',data:{labels:['Erro'],datasets:[]},options:{responsive:true,plugins:{legend:{labels:{color:'#cbd5e1'}},tooltip:{enabled:false}},scales:{x:{ticks:{color:'#94a3b8'},grid:{color:'rgba(148,163,184,.12)'}},y:{beginAtZero:true,ticks:{color:'#94a3b8'},grid:{color:'rgba(148,163,184,.12)'}}}}});
+    const parent=ctx.parentElement;
+    if(parent&&!parent.querySelector('.chart-error-message')){
+      const p=document.createElement('p');
+      p.className='chart-error-message text-sm text-red-300 mt-3';
+      p.innerText=`Erro ao carregar gráfico: ${e.message}. Verifique as políticas RLS das tabelas predictions e official_results.`;
+      parent.appendChild(p);
+    }
+  }
+}
 function selectedAiAgents(){const agents=[...document.querySelectorAll('.ai-agent-check:checked')].map(i=>i.value);return agents.length?agents:['data']}function seededRandom(seed){let h=2166136261>>>0;for(let i=0;i<seed.length;i++){h^=seed.charCodeAt(i);h=Math.imul(h,16777619)}return()=>{h+=h<<13;h^=h>>>7;h+=h<<3;h^=h>>>17;h+=h<<5;return((h>>>0)/4294967295)}}
 function aiPredictFixture(f,agents,upsetLevel){const rnd=seededRandom(`${f.group}-${f.round}-${f.home}-${f.away}-${agents.join(',')}-${upsetLevel}`);const marketBias=agents.includes('market')?-.7:0;const chaos=agents.reduce((sum,a)=>sum+(AI_AGENT_BIAS[a]||0),0)/Math.max(1,agents.length);let diff=(TEAM_RATINGS[f.home]||72)-(TEAM_RATINGS[f.away]||72)+.6;const upsetChance=(upsetLevel/100)*(.25+Math.max(0,chaos)/10);if(rnd()<upsetChance&&Math.abs(diff)>7)diff=rnd()<.75?diff*.15:diff*-.2;let total=Math.max(0,Math.min(5,Math.round(2.35+marketBias+Math.abs(diff)/22+(rnd()-.5)*2)));let home=Math.max(0,Math.min(5,Math.round(total/2+diff/11+(rnd()-.5))));let away=Math.max(0,Math.min(5,total-home));return{home,away}}
 function applyAiPredictions(){const agents=selectedAiAgents(),upsetLevel=Number($('aiUpsetLevel')?.value||25),inputs=[...document.querySelectorAll('.score-input')];allFixtures().forEach((f,idx)=>{const p=aiPredictFixture(f,agents,upsetLevel);if(inputs[idx*2])inputs[idx*2].value=p.home;if(inputs[idx*2+1])inputs[idx*2+1].value=p.away});alert('Bolão preenchido com AI. Revise os placares e clique em Salvar palpites.')}
