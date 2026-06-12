@@ -192,65 +192,151 @@ function sameLineUsers(users,targetUser){
   return users.filter(u=>u.pointsByStep.length===targetUser.pointsByStep.length && u.pointsByStep.every((v,i)=>v===targetUser.pointsByStep[i]));
 }
 async function renderChart(){
-  const ctx=$('pointsChart');
-  if(chart)chart.destroy();
-  try{
-    const {labels,users,rounds}=await computeChartSeries();
-    if(!users.length){
-      chart=new Chart(ctx,{type:'line',data:{labels:['Início'],datasets:[]},options:{responsive:true,plugins:{legend:{labels:{color:'#cbd5e1'}}},scales:{x:{ticks:{color:'#94a3b8'},grid:{color:'rgba(148,163,184,.12)'}},y:{beginAtZero:true,ticks:{color:'#94a3b8'},grid:{color:'rgba(148,163,184,.12)'}}}}});
-      return;
-    }
-    const datasets=users.map((u,idx)=>({
-      label:u.name,
-      data:u.pointsByStep,
-      tension:.35,
-      pointRadius:5,
-      pointHoverRadius:8,
-      borderWidth:2,
-      userIndex:idx
-    }));
-    chart=new Chart(ctx,{
-      type:'line',
-      data:{labels,datasets},
-      options:{
-        responsive:true,
-        interaction:{mode:'nearest',intersect:true},
-        plugins:{
-          legend:{labels:{color:'#cbd5e1'}},
-          tooltip:{
-            callbacks:{
-              title:function(items){
-                const item=items[0];
-                return item?.label || '';
-              },
-              label:function(context){
-                const user=users[context.dataset.userIndex];
-                const pointIndex=context.dataIndex;
-                const points=context.parsed.y;
-                const tied=sameLineUsers(users,user).filter(u=>u.pointsByStep[pointIndex]===points);
-                const names=tied.map(u=>u.name);
-                const header=`${points} ponto${points===1?'':'s'}: ${names.length} participante${names.length===1?'':'s'}`;
-                return [header,...names];
-              }
+  const official = await getOfficialResults();
+  const {data, error} = await sb.from('predictions').select('*');
+
+  const canvas = $('pointsChart');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+
+  if (chart) chart.destroy();
+
+  if (error) {
+    chart = new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels: ['Erro'],
+        datasets: [{
+          label: 'Erro ao carregar ranking',
+          data: [0],
+          tension: .35
+        }]
+      },
+      options: {
+        responsive: true,
+        plugins: {
+          legend: { labels: { color: '#cbd5e1' } },
+          tooltip: {
+            callbacks: {
+              label: () => 'Erro ao ler predictions. Verifique RLS no Supabase.'
             }
           }
         },
-        scales:{
-          x:{ticks:{color:'#94a3b8'},grid:{color:'rgba(148,163,184,.12)'}},
-          y:{beginAtZero:true,ticks:{color:'#94a3b8'},grid:{color:'rgba(148,163,184,.12)'}}
+        scales: {
+          x: { ticks: { color: '#94a3b8' }, grid: { color: 'rgba(148,163,184,.12)' } },
+          y: { beginAtZero: true, ticks: { color: '#94a3b8', precision: 0, callback: value => Number(value).toFixed(0) }, grid: { color: 'rgba(148,163,184,.12)' } }
         }
       }
     });
-  }catch(e){
-    chart=new Chart(ctx,{type:'line',data:{labels:['Erro'],datasets:[]},options:{responsive:true,plugins:{legend:{labels:{color:'#cbd5e1'}},tooltip:{enabled:false}},scales:{x:{ticks:{color:'#94a3b8'},grid:{color:'rgba(148,163,184,.12)'}},y:{beginAtZero:true,ticks:{color:'#94a3b8'},grid:{color:'rgba(148,163,184,.12)'}}}}});
-    const parent=ctx.parentElement;
-    if(parent&&!parent.querySelector('.chart-error-message')){
-      const p=document.createElement('p');
-      p.className='chart-error-message text-sm text-red-300 mt-3';
-      p.innerText=`Erro ao carregar gráfico: ${e.message}. Verifique as políticas RLS das tabelas predictions e official_results.`;
-      parent.appendChild(p);
-    }
+    return;
   }
+
+  const predictions = data || [];
+  const fixtures = allFixtures();
+
+  function isOfficialFilled(result){
+    return result &&
+      result.home !== '' &&
+      result.away !== '' &&
+      result.home !== undefined &&
+      result.away !== undefined &&
+      result.home !== null &&
+      result.away !== null;
+  }
+
+  // Mostra até a última rodada que tenha pelo menos um placar oficial preenchido.
+  // Soma apenas os jogos que já têm placar oficial.
+  const updatedRounds = [1,2,3].filter(round =>
+    fixtures.some(f => f.round === round && isOfficialFilled(official[matchKey(f)]))
+  );
+
+  const labels = ['Início', ...updatedRounds.map(r => `Rodada ${r}`)];
+
+  const datasets = predictions.map(user => {
+    let cumulative = 0;
+    const points = [0];
+
+    updatedRounds.forEach(round => {
+      fixtures
+        .filter(f => f.round === round)
+        .forEach(f => {
+          const k = matchKey(f);
+          if (isOfficialFilled(official[k])) {
+            cumulative += scorePrediction(user.matches?.[k] || {}, official[k]);
+          }
+        });
+      points.push(cumulative);
+    });
+
+    return {
+      label: user.user_name || user.email,
+      data: points,
+      tension: .35,
+      pointRadius: 5,
+      pointHoverRadius: 7
+    };
+  });
+
+  const groupedNamesByPoint = {};
+  labels.forEach((label, index) => {
+    const byScore = {};
+    datasets.forEach(ds => {
+      const score = ds.data[index];
+      if (!byScore[score]) byScore[score] = [];
+      byScore[score].push(ds.label);
+    });
+    groupedNamesByPoint[index] = byScore;
+  });
+
+  chart = new Chart(ctx, {
+    type: 'line',
+    data: { labels, datasets },
+    options: {
+      responsive: true,
+      interaction: {
+        mode: 'nearest',
+        intersect: true
+      },
+      plugins: {
+        legend: { labels: { color: '#cbd5e1' } },
+        tooltip: {
+          callbacks: {
+            title: items => {
+              const item = items[0];
+              return `${item.label} — ${Math.round(item.parsed.y)} pts`;
+            },
+            label: item => {
+              const index = item.dataIndex;
+              const score = item.parsed.y;
+              const names = groupedNamesByPoint[index]?.[score] || [item.dataset.label];
+              return names;
+            },
+            afterBody: items => {
+              const item = items[0];
+              const names = groupedNamesByPoint[item.dataIndex]?.[item.parsed.y] || [];
+              return names.length > 1 ? [`Total empatados: ${names.length}`] : [];
+            }
+          }
+        }
+      },
+      scales: {
+        x: {
+          ticks: { color: '#94a3b8' },
+          grid: { color: 'rgba(148,163,184,.12)' }
+        },
+        y: {
+          beginAtZero: true,
+          ticks: {
+            color: '#94a3b8',
+            precision: 0,
+            stepSize: 1,
+            callback: value => Number(value).toFixed(0)
+          },
+          grid: { color: 'rgba(148,163,184,.12)' }
+        }
+      }
+    }
+  });
 }
 function selectedAiAgents(){const agents=[...document.querySelectorAll('.ai-agent-check:checked')].map(i=>i.value);return agents.length?agents:['data']}function seededRandom(seed){let h=2166136261>>>0;for(let i=0;i<seed.length;i++){h^=seed.charCodeAt(i);h=Math.imul(h,16777619)}return()=>{h+=h<<13;h^=h>>>7;h+=h<<3;h^=h>>>17;h+=h<<5;return((h>>>0)/4294967295)}}
 function aiPredictFixture(f,agents,upsetLevel){const rnd=seededRandom(`${f.group}-${f.round}-${f.home}-${f.away}-${agents.join(',')}-${upsetLevel}`);const marketBias=agents.includes('market')?-.7:0;const chaos=agents.reduce((sum,a)=>sum+(AI_AGENT_BIAS[a]||0),0)/Math.max(1,agents.length);let diff=(TEAM_RATINGS[f.home]||72)-(TEAM_RATINGS[f.away]||72)+.6;const upsetChance=(upsetLevel/100)*(.25+Math.max(0,chaos)/10);if(rnd()<upsetChance&&Math.abs(diff)>7)diff=rnd()<.75?diff*.15:diff*-.2;let total=Math.max(0,Math.min(5,Math.round(2.35+marketBias+Math.abs(diff)/22+(rnd()-.5)*2)));let home=Math.max(0,Math.min(5,Math.round(total/2+diff/11+(rnd()-.5))));let away=Math.max(0,Math.min(5,total-home));return{home,away}}
