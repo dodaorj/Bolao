@@ -336,13 +336,19 @@ async function renderChart(){
               if (!updatedRounds.length) return 'Confira se os placares foram salvos em official_results.';
               const index = item.dataIndex;
               const score = item.parsed.y;
-              return groupedNamesByPoint[index]?.[score] || [item.dataset.label];
+              const names = [...new Set(groupedNamesByPoint[index]?.[score] || [item.dataset.label])];
+
+              // Mostra apenas uma linha no tooltip para cada dataset.
+              // A lista completa dos empatados fica no afterBody, sem repetir 4 vezes.
+              return item.dataset.label;
             },
             afterBody: items => {
               if (!updatedRounds.length) return ['Abra F12 > Console para ver o que foi lido do Supabase.'];
               const item = items[0];
-              const names = groupedNamesByPoint[item.dataIndex]?.[item.parsed.y] || [];
-              return names.length > 1 ? [`Total empatados: ${names.length}`] : [];
+              const names = [...new Set(groupedNamesByPoint[item.dataIndex]?.[item.parsed.y] || [])];
+
+              if (names.length <= 1) return [];
+              return ['Empatados:', ...names, `Total empatados: ${names.length}`];
             }
           }
         }
